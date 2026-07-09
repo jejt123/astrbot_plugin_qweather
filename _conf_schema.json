@@ -1,0 +1,79 @@
+{
+  "qweather_api_key": {
+    "description": "和风天气 API Key",
+    "type": "string",
+    "hint": "在和风天气开发者控制台创建项目与凭据后填写。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "qweather_api_host": {
+    "description": "和风天气 API Host",
+    "type": "string",
+    "hint": "例如 https://devapi.qweather.com；如果你在控制台获得了专属 Host，请填写专属 Host。",
+    "default": "https://devapi.qweather.com"
+  },
+  "default_city": {
+    "description": "默认城市",
+    "type": "string",
+    "hint": "/天气 不带城市时使用；/通勤 查询天气时也会作为兜底城市。",
+    "default": ""
+  },
+  "home_location": {
+    "description": "家地址或所在区域",
+    "type": "string",
+    "hint": "用于上班通勤天气参考，例如：北京市海淀区。",
+    "default": ""
+  },
+  "home_coordinates": {
+    "description": "家坐标（可选）",
+    "type": "string",
+    "hint": "用于更精准的上班出发地天气参考。格式：经度,纬度，例如 116.41,39.92；留空则使用家地址。",
+    "default": ""
+  },
+  "work_location": {
+    "description": "公司地址或所在区域",
+    "type": "string",
+    "hint": "用于下班通勤天气参考，例如：北京市朝阳区。",
+    "default": ""
+  },
+  "work_coordinates": {
+    "description": "公司坐标（可选）",
+    "type": "string",
+    "hint": "用于更精准的下班出发地天气参考。格式：经度,纬度，例如 116.41,39.92；留空则使用公司地址。",
+    "default": ""
+  },
+  "morning_commute_time": {
+    "description": "上班通勤时间段",
+    "type": "string",
+    "hint": "格式：HH:MM-HH:MM，例如 08:00-09:00。",
+    "default": "08:00-09:00"
+  },
+  "evening_commute_time": {
+    "description": "下班通勤时间段",
+    "type": "string",
+    "hint": "格式：HH:MM-HH:MM，例如 18:00-19:00。",
+    "default": "18:00-19:00"
+  },
+  "commute_methods": {
+    "description": "可选通勤方式",
+    "type": "text",
+    "hint": "必填。可自由输入，例如：地铁、公交、骑行、开车、打车。模型会基于这些方式给出建议。",
+    "default": ""
+  },
+  "enable_model_polish": {
+    "description": "启用默认模型整理和推荐",
+    "type": "bool",
+    "hint": "开启后，/天气 和 /通勤 会先生成结构化数据，再调用当前默认模型清理、归纳并输出更自然的建议；模型不可用时自动使用模板输出。",
+    "default": true
+  },
+  "request_timeout_seconds": {
+    "description": "和风天气请求超时时间（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "model_timeout_seconds": {
+    "description": "模型整理超时时间（秒）",
+    "type": "int",
+    "default": 45
+  }
+}
