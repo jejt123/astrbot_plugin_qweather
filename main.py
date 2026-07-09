@@ -59,20 +59,39 @@ class QWeatherClient:
         self._location_cache[keyword] = location_id
         return location_id
 
+    async def resolve_weather_location(self, keyword: str) -> str:
+        coordinate = self._normalize_coordinate(keyword)
+        if coordinate:
+            return coordinate
+        return await self.lookup_location(keyword)
+
     async def daily_weather(self, keyword: str) -> list[dict[str, Any]]:
-        location_id = await self.lookup_location(keyword)
-        payload = await self._get_json("/v7/weather/3d", {"location": location_id})
+        location = await self.resolve_weather_location(keyword)
+        payload = await self._get_json("/v7/weather/3d", {"location": location})
         return payload.get("daily") or []
 
     async def hourly_weather(self, keyword: str) -> list[dict[str, Any]]:
-        location_id = await self.lookup_location(keyword)
-        payload = await self._get_json("/v7/weather/24h", {"location": location_id})
+        location = await self.resolve_weather_location(keyword)
+        payload = await self._get_json("/v7/weather/24h", {"location": location})
         return payload.get("hourly") or []
 
     async def weather_warning(self, keyword: str) -> list[dict[str, Any]]:
-        location_id = await self.lookup_location(keyword)
-        payload = await self._get_json("/v7/warning/now", {"location": location_id})
+        location = await self.resolve_weather_location(keyword)
+        payload = await self._get_json("/v7/warning/now", {"location": location})
         return payload.get("warning") or []
+
+    def _normalize_coordinate(self, value: str) -> str | None:
+        match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", value or "")
+        if not match:
+            return None
+        longitude = float(match.group(1))
+        latitude = float(match.group(2))
+        if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+            raise QWeatherError("经纬度格式应为：经度,纬度，例如 116.41,39.92。")
+        return f"{self._format_coordinate(longitude)},{self._format_coordinate(latitude)}"
+
+    def _format_coordinate(self, value: float) -> str:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
 
     async def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.api_key:
@@ -239,27 +258,58 @@ class QWeatherPlugin(Star):
     async def _build_commute_payload(self, scene: CommuteScene, morning: TimeRange, evening: TimeRange) -> dict[str, Any]:
         home = self._conf("home_location")
         work = self._conf("work_location")
+        home_weather_location = str(self._conf("home_coordinates") or "").strip() or home
+        work_weather_location = str(self._conf("work_coordinates") or "").strip() or work
         sections: list[dict[str, Any]] = []
         if scene.include_morning:
-            sections.append(await self._build_commute_section("上班", home, work, scene.target_date, morning))
+            sections.append(
+                await self._build_commute_section(
+                    "上班",
+                    home,
+                    work,
+                    home_weather_location,
+                    scene.target_date,
+                    morning,
+                )
+            )
         if scene.include_evening:
-            sections.append(await self._build_commute_section("下班", work, home, scene.target_date, evening))
+            sections.append(
+                await self._build_commute_section(
+                    "下班",
+                    work,
+                    home,
+                    work_weather_location,
+                    scene.target_date,
+                    evening,
+                )
+            )
         return {
             "scene": scene.title,
             "target_date": scene.target_date.isoformat(),
             "home_location": home,
             "work_location": work,
+            "home_weather_location": home_weather_location,
+            "work_weather_location": work_weather_location,
             "commute_methods": self._conf("commute_methods"),
             "sections": sections,
         }
 
-    async def _build_commute_section(self, name: str, origin: str, destination: str, target_date: date, time_range: TimeRange) -> dict[str, Any]:
-        hourly = await self.client.hourly_weather(origin)
+    async def _build_commute_section(
+        self,
+        name: str,
+        origin: str,
+        destination: str,
+        weather_location: str,
+        target_date: date,
+        time_range: TimeRange,
+    ) -> dict[str, Any]:
+        hourly = await self.client.hourly_weather(weather_location)
         matched = self._match_hourly(hourly, target_date, time_range)
         return {
             "name": name,
             "origin": origin,
             "destination": destination,
+            "weather_location": weather_location,
             "time_range": self._format_range(time_range),
             "weather": matched,
             "rule_summary": self._commute_rule_summary(matched),
@@ -359,6 +409,8 @@ class QWeatherPlugin(Star):
         for section in payload["sections"]:
             lines.append(f"{section['name']} {section['time_range']}")
             lines.append(f"路线：{section['origin']} → {section['destination']}")
+            if section.get("weather_location") and section["weather_location"] != section["origin"]:
+                lines.append(f"天气参考位置：{section['weather_location']}")
             if section["weather"]:
                 desc = []
                 for hour in section["weather"]:

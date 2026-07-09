@@ -24,10 +24,22 @@
     "hint": "用于上班通勤天气参考，例如：北京市海淀区。",
     "default": ""
   },
+  "home_coordinates": {
+    "description": "家坐标（可选）",
+    "type": "string",
+    "hint": "用于更精准的上班出发地天气参考。格式：经度,纬度，例如 116.41,39.92；留空则使用家地址。",
+    "default": ""
+  },
   "work_location": {
     "description": "公司地址或所在区域",
     "type": "string",
     "hint": "用于下班通勤天气参考，例如：北京市朝阳区。",
+    "default": ""
+  },
+  "work_coordinates": {
+    "description": "公司坐标（可选）",
+    "type": "string",
+    "hint": "用于更精准的下班出发地天气参考。格式：经度,纬度，例如 116.41,39.92；留空则使用公司地址。",
     "default": ""
   },
   "morning_commute_time": {
