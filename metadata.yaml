@@ -1,0 +1,5 @@
+name: astrbot_plugin_qweather
+desc: 基于和风天气的轻量天气与通勤建议插件，支持 /天气、/通勤、/天气帮助。
+version: v0.1.3
+author: OpenAI
+repo: https://github.com/jejt123/astrbot_plugin_qweather
