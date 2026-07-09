@@ -49,6 +49,7 @@ class QWeatherClient:
         jwt_key_id: str = "",
         jwt_private_key: str = "",
         jwt_ttl_seconds: int = 900,
+        log_level: str = "info",
     ):
         self.api_key = api_key.strip()
         self.api_host = api_host.rstrip("/").strip() or "https://devapi.qweather.com"
@@ -59,6 +60,7 @@ class QWeatherClient:
         self.jwt_ttl_seconds = max(60, min(int(jwt_ttl_seconds or 900), 86400))
         self._jwt_token = ""
         self._jwt_expires_at = 0
+        self.log_level = self._normalize_log_level(log_level)
         self._location_cache: dict[str, str] = {}
 
     async def lookup_location(self, keyword: str) -> str:
@@ -113,12 +115,15 @@ class QWeatherClient:
 
     async def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         headers: dict[str, str] = {}
-        if self._auth_mode() == "jwt":
+        auth_mode = self._auth_mode()
+        if auth_mode == "jwt":
             headers["Authorization"] = f"Bearer {self._get_jwt_token()}"
             query = {**params, "lang": "zh", "unit": "m"}
         else:
             query = {**params, "key": self.api_key, "lang": "zh", "unit": "m"}
         url = f"{self.api_host}{path}?{urllib.parse.urlencode(query)}"
+        self._log_info(f"QWeather request: auth_mode={auth_mode}, path={path}")
+        self._log_debug("QWeather request: " + self._dump_log_data({"auth_mode": auth_mode, "method": "GET", "url": self._sanitize_url(url), "path": path, "params": self._sanitize_payload(query)}))
         return await asyncio.to_thread(self._blocking_get_json, url, headers)
 
     def _blocking_get_json(self, url: str, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -134,9 +139,13 @@ class QWeatherClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 data = json.loads(self._decode_response_body(response.read(), response.headers))
+                self._log_info(f"QWeather response: code={data.get('code')}, url={self._sanitize_url(url)}")
+                self._log_debug("QWeather response: " + self._dump_log_data({"url": self._sanitize_url(url), "status": getattr(response, "status", None), "data": self._sanitize_payload(data)}))
         except urllib.error.HTTPError as exc:
+            self._log_warn(f"QWeather HTTP error: status={exc.code}, url={self._sanitize_url(url)}")
             raise QWeatherError(f"和风天气 HTTP 错误：{exc.code}") from exc
         except urllib.error.URLError as exc:
+            self._log_warn(f"QWeather request failed: reason={exc.reason}, url={self._sanitize_url(url)}")
             raise QWeatherError(f"和风天气请求失败：{exc.reason}") from exc
         except UnicodeDecodeError as exc:
             raise QWeatherError("和风天气返回了无法解码的数据。") from exc
@@ -144,6 +153,7 @@ class QWeatherClient:
             raise QWeatherError("和风天气返回了无法解析的数据。") from exc
         code = str(data.get("code", ""))
         if code and code != "200":
+            self._log_warn(f"QWeather API error code: code={code}, url={self._sanitize_url(url)}, data={self._dump_log_data(self._sanitize_payload(data))}")
             raise QWeatherError(f"和风天气返回错误码：{code}")
         return data
 
@@ -186,8 +196,50 @@ class QWeatherClient:
     def _normalize_private_key(self, value: str) -> str:
         return (value or "").strip().replace("\\n", "\n")
 
+    def _normalize_log_level(self, value: str) -> str:
+        level = (value or "info").strip().lower()
+        return level if level in {"debug", "info", "warn"} else "info"
 
-@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.3")
+    def _should_log(self, level: str) -> bool:
+        order = {"debug": 10, "info": 20, "warn": 30}
+        return order[level] >= order[self.log_level]
+
+    def _log_debug(self, message: str) -> None:
+        if self._should_log("debug"):
+            logger.debug(message)
+
+    def _log_info(self, message: str) -> None:
+        if self._should_log("info"):
+            logger.info(message)
+
+    def _log_warn(self, message: str) -> None:
+        if self._should_log("warn"):
+            logger.warning(message)
+
+    def _sanitize_url(self, url: str) -> str:
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        safe_pairs = [(key, "***" if self._is_sensitive_key(key) else value) for key, value in query]
+        safe_query = urllib.parse.urlencode(safe_pairs)
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, safe_query, parsed.fragment))
+
+    def _sanitize_payload(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: ("***" if self._is_sensitive_key(str(key)) else self._sanitize_payload(item)) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize_payload(item) for item in value]
+        return value
+
+    def _is_sensitive_key(self, key: str) -> bool:
+        lowered = key.lower()
+        return any(word in lowered for word in ["key", "token", "authorization", "jwt", "private", "secret"])
+
+    def _dump_log_data(self, value: Any) -> str:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        return text if len(text) <= 2000 else text[:2000] + "...<truncated>"
+
+
+@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.5")
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -200,11 +252,12 @@ class QWeatherPlugin(Star):
             jwt_key_id=self._conf("qweather_jwt_key_id"),
             jwt_private_key=self._conf("qweather_jwt_private_key"),
             jwt_ttl_seconds=int(self._conf("qweather_jwt_ttl_seconds", 900) or 900),
+            log_level=self._conf("qweather_log_level", "info"),
         )
 
     @filter.command("天气")
     async def weather(self, event: AstrMessageEvent, city: str | None = None):
-        """查询明日天气、未来三天简报、穿衣和生活建议。"""
+        """按当前时间自动查询今日/明日天气、天气简报、穿衣和生活建议。"""
         try:
             location = (city or self._conf("default_city")).strip()
             if not location:
@@ -212,10 +265,13 @@ class QWeatherPlugin(Star):
                 return
             daily = await self.client.daily_weather(location)
             warnings = await self._safe_warnings(location)
-            draft = self._build_weather_payload(location, daily, warnings)
+            switch_time = self._parse_time_of_day(self._conf("weather_day_switch_time", "18:00"))
+            draft = self._build_weather_payload(location, daily, warnings, datetime.now(), switch_time)
             fallback = self._format_weather(draft)
             text = await self._polish_with_model(event, "weather", draft, fallback)
             yield event.plain_result(text)
+        except ValueError as exc:
+            yield event.plain_result(f"天气日期切换时间配置有误：{exc}")
         except QWeatherError as exc:
             yield event.plain_result(f"天气查询失败：{exc}")
         except Exception as exc:  # AstrBot should return user-friendly failures for command handlers.
@@ -253,7 +309,7 @@ class QWeatherPlugin(Star):
             "🌤️ 和风天气插件帮助\n\n"
             "可用命令：\n"
             "1. /天气 [城市]\n"
-            "   查询指定城市明日详细天气、未来 3 天简报、穿衣和生活建议。\n"
+            "   根据插件配置的日期切换时间，查询指定城市今日或明日详细天气、天气简报、穿衣和生活建议。\n"
             "   示例：/天气 北京\n\n"
             "2. /天气\n"
             "   查询插件配置页面中的默认城市。\n\n"
@@ -276,18 +332,32 @@ class QWeatherPlugin(Star):
             logger.warning(f"天气预警查询失败，已忽略：{exc}")
             return []
 
-    def _build_weather_payload(self, location: str, daily: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_weather_payload(
+        self,
+        location: str,
+        daily: list[dict[str, Any]],
+        warnings: list[dict[str, Any]],
+        now: datetime,
+        switch_time: time,
+    ) -> dict[str, Any]:
         if not daily:
             raise QWeatherError("和风天气没有返回未来天气数据。")
-        tomorrow = daily[1] if len(daily) > 1 else daily[0]
-        three_days = daily[:3]
+        target_index = 1 if now.time().replace(second=0, microsecond=0) >= switch_time else 0
+        if target_index >= len(daily):
+            target_index = len(daily) - 1
+        target_day = daily[target_index]
+        summary_days = daily[target_index:target_index + 3]
+        target_label = "明日天气" if target_index == 1 else "今日天气"
+        summary_label = "未来天气简报" if target_index == 1 else "最近 3 天天气"
         return {
             "location": location,
-            "target": "明日天气",
-            "tomorrow": tomorrow,
-            "next_three_days": three_days,
+            "target": target_label,
+            "target_date": target_day.get("fxDate", ""),
+            "target_day": target_day,
+            "summary_label": summary_label,
+            "next_three_days": summary_days,
             "warnings": warnings,
-            "rule_advice": self._weather_rule_advice(tomorrow, three_days, warnings),
+            "rule_advice": self._weather_rule_advice(target_day, summary_days, warnings),
         }
 
     def _weather_rule_advice(self, day: dict[str, Any], three_days: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> dict[str, str]:
@@ -445,8 +515,8 @@ class QWeatherPlugin(Star):
         )
 
     def _format_weather(self, payload: dict[str, Any]) -> str:
-        day = payload["tomorrow"]
-        lines = [f"📍 {payload['location']} · 明日天气", ""]
+        day = payload["target_day"]
+        lines = [f"📍 {payload['location']} · {payload['target']}", ""]
         lines += [
             f"天气：{day.get('textDay', '-')}/{day.get('textNight', '-')}",
             f"气温：{day.get('tempMin', '-')}℃ - {day.get('tempMax', '-')}℃",
@@ -457,7 +527,7 @@ class QWeatherPlugin(Star):
         if payload.get("warnings"):
             lines.append("⚠️ 预警：" + "；".join(w.get("title", "天气预警") for w in payload["warnings"][:2]))
         advice = payload["rule_advice"]
-        lines += ["", "👕 穿衣建议：" + advice["穿衣"], "☔ 出行建议：" + advice["带伞"], "🏃 生活建议：" + advice["洗车"] + advice["户外"], "", "📅 未来 3 天"]
+        lines += ["", "👕 穿衣建议：" + advice["穿衣"], "☔ 出行建议：" + advice["带伞"], "🏃 生活建议：" + advice["洗车"] + advice["户外"], "", f"📅 {payload['summary_label']}"]
         for item in payload["next_three_days"]:
             lines.append(f"{item.get('fxDate', '-')}: {item.get('textDay', '-')}/{item.get('textNight', '-')}，{item.get('tempMin', '-')}℃ - {item.get('tempMax', '-')}℃")
         return "\n".join(lines)
@@ -498,6 +568,13 @@ class QWeatherPlugin(Star):
             raise ValueError("时间段格式应为 HH:MM-HH:MM，例如 08:00-09:00。")
         h1, m1, h2, m2 = map(int, match.groups())
         return TimeRange(time(h1, m1), time(h2, m2))
+
+    def _parse_time_of_day(self, value: str) -> time:
+        match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value or "")
+        if not match:
+            raise ValueError("时间格式应为 HH:MM，例如 18:00。")
+        hour, minute = map(int, match.groups())
+        return time(hour, minute)
 
     def _validate_commute_ranges(self, morning: TimeRange, evening: TimeRange) -> None:
         if not (morning.start < morning.end < evening.start < evening.end):

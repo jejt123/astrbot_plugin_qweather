@@ -36,11 +36,28 @@
     "hint": "例如 https://devapi.qweather.com；如果你在控制台获得了专属 Host，请填写专属 Host。",
     "default": "https://devapi.qweather.com"
   },
+  "qweather_log_level": {
+    "description": "日志输出级别",
+    "type": "string",
+    "options": [
+      "debug",
+      "info",
+      "warn"
+    ],
+    "hint": "控制插件内部和风天气请求日志输出级别。debug 会记录请求和返回数据摘要；日志会隐藏 API Key、JWT、私钥等敏感信息。",
+    "default": "info"
+  },
   "default_city": {
     "description": "默认城市",
     "type": "string",
     "hint": "/天气 不带城市时使用；/通勤 查询天气时也会作为兜底城市。",
     "default": ""
+  },
+  "weather_day_switch_time": {
+    "description": "天气日期切换时间",
+    "type": "string",
+    "hint": "格式：HH:MM。当前时间达到或晚于该时间时，/天气 默认展示明天天气；早于该时间时展示今天天气。",
+    "default": "18:00"
   },
   "home_location": {
     "description": "家地址或所在区域",
