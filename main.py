@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import re
 import urllib.error
@@ -81,20 +82,36 @@ class QWeatherClient:
         return await asyncio.to_thread(self._blocking_get_json, url)
 
     def _blocking_get_json(self, url: str) -> dict[str, Any]:
-        request = urllib.request.Request(url, headers={"User-Agent": "astrbot-plugin-qweather/0.1"})
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "astrbot-plugin-qweather/0.1",
+                "Accept-Encoding": "gzip, identity",
+            },
+        )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                data = json.loads(self._decode_response_body(response.read(), response.headers))
         except urllib.error.HTTPError as exc:
             raise QWeatherError(f"和风天气 HTTP 错误：{exc.code}") from exc
         except urllib.error.URLError as exc:
             raise QWeatherError(f"和风天气请求失败：{exc.reason}") from exc
+        except UnicodeDecodeError as exc:
+            raise QWeatherError("和风天气返回了无法解码的数据。") from exc
         except json.JSONDecodeError as exc:
             raise QWeatherError("和风天气返回了无法解析的数据。") from exc
         code = str(data.get("code", ""))
         if code and code != "200":
             raise QWeatherError(f"和风天气返回错误码：{code}")
         return data
+
+    def _decode_response_body(self, body: bytes, headers: Any) -> str:
+        encoding = ""
+        if headers:
+            encoding = str(headers.get("Content-Encoding", "")).lower()
+        if "gzip" in encoding or body.startswith(b"\x1f\x8b"):
+            body = gzip.decompress(body)
+        return body.decode("utf-8")
 
 
 @register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.0")
