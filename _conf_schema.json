@@ -6,6 +6,30 @@
     "obvious_hint": true,
     "default": ""
   },
+  "qweather_jwt_project_id": {
+    "description": "和风天气 JWT Project ID（可选）",
+    "type": "string",
+    "hint": "JWT 认证使用。与 Credential ID、Private Key 同时填写时优先使用 JWT；全部留空则使用 API Key。",
+    "default": ""
+  },
+  "qweather_jwt_key_id": {
+    "description": "和风天气 JWT Credential ID（可选）",
+    "type": "string",
+    "hint": "JWT Header 中的 kid。JWT 三项只填一部分会报错，不会静默回退 API Key。",
+    "default": ""
+  },
+  "qweather_jwt_private_key": {
+    "description": "和风天气 JWT Ed25519 Private Key（可选）",
+    "type": "text",
+    "hint": "Ed25519 私钥 PEM。支持直接粘贴多行 PEM，也支持使用 \\n 表示换行。",
+    "default": ""
+  },
+  "qweather_jwt_ttl_seconds": {
+    "description": "JWT 有效期（秒）",
+    "type": "int",
+    "hint": "默认 900 秒；插件会限制在 60 到 86400 秒之间，并在过期前自动刷新。",
+    "default": 900
+  },
   "qweather_api_host": {
     "description": "和风天气 API Host",
     "type": "string",

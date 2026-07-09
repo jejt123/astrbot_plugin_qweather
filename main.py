@@ -4,12 +4,15 @@ import asyncio
 import gzip
 import json
 import re
+import time as time_module
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
+
+import jwt
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -37,10 +40,25 @@ class QWeatherError(Exception):
 
 
 class QWeatherClient:
-    def __init__(self, api_key: str, api_host: str, timeout: int = 10):
+    def __init__(
+        self,
+        api_key: str,
+        api_host: str,
+        timeout: int = 10,
+        jwt_project_id: str = "",
+        jwt_key_id: str = "",
+        jwt_private_key: str = "",
+        jwt_ttl_seconds: int = 900,
+    ):
         self.api_key = api_key.strip()
         self.api_host = api_host.rstrip("/").strip() or "https://devapi.qweather.com"
         self.timeout = max(1, timeout)
+        self.jwt_project_id = jwt_project_id.strip()
+        self.jwt_key_id = jwt_key_id.strip()
+        self.jwt_private_key = self._normalize_private_key(jwt_private_key)
+        self.jwt_ttl_seconds = max(60, min(int(jwt_ttl_seconds or 900), 86400))
+        self._jwt_token = ""
+        self._jwt_expires_at = 0
         self._location_cache: dict[str, str] = {}
 
     async def lookup_location(self, keyword: str) -> str:
@@ -94,19 +112,24 @@ class QWeatherClient:
         return f"{value:.6f}".rstrip("0").rstrip(".")
 
     async def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        if not self.api_key:
-            raise QWeatherError("尚未在插件配置页面填写和风天气 API Key。")
-        query = {**params, "key": self.api_key, "lang": "zh", "unit": "m"}
+        headers: dict[str, str] = {}
+        if self._auth_mode() == "jwt":
+            headers["Authorization"] = f"Bearer {self._get_jwt_token()}"
+            query = {**params, "lang": "zh", "unit": "m"}
+        else:
+            query = {**params, "key": self.api_key, "lang": "zh", "unit": "m"}
         url = f"{self.api_host}{path}?{urllib.parse.urlencode(query)}"
-        return await asyncio.to_thread(self._blocking_get_json, url)
+        return await asyncio.to_thread(self._blocking_get_json, url, headers)
 
-    def _blocking_get_json(self, url: str) -> dict[str, Any]:
+    def _blocking_get_json(self, url: str, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
+        headers = {
+            "User-Agent": "astrbot-plugin-qweather/0.1",
+            "Accept-Encoding": "gzip, identity",
+        }
+        headers.update(extra_headers or {})
         request = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": "astrbot-plugin-qweather/0.1",
-                "Accept-Encoding": "gzip, identity",
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -132,8 +155,39 @@ class QWeatherClient:
             body = gzip.decompress(body)
         return body.decode("utf-8")
 
+    def _auth_mode(self) -> str:
+        jwt_values = [self.jwt_project_id, self.jwt_key_id, self.jwt_private_key]
+        if all(jwt_values):
+            return "jwt"
+        if any(jwt_values):
+            raise QWeatherError("JWT 配置不完整，请同时填写 Project ID、Credential ID 和 Private Key；或清空 JWT 配置以使用 API Key。")
+        if self.api_key:
+            return "api_key"
+        raise QWeatherError("尚未在插件配置页面填写和风天气 JWT 或 API Key。")
 
-@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.0")
+    def _get_jwt_token(self) -> str:
+        now = int(time_module.time())
+        if self._jwt_token and now < self._jwt_expires_at - 60:
+            return self._jwt_token
+        expires_at = now + self.jwt_ttl_seconds
+        try:
+            token = jwt.encode(
+                {"sub": self.jwt_project_id, "iat": now, "exp": expires_at},
+                self.jwt_private_key,
+                algorithm="EdDSA",
+                headers={"kid": self.jwt_key_id},
+            )
+        except Exception as exc:
+            raise QWeatherError(f"JWT 生成失败，请检查 Project ID、Credential ID 和 Private Key：{exc}") from exc
+        self._jwt_token = token if isinstance(token, str) else token.decode("utf-8")
+        self._jwt_expires_at = expires_at
+        return self._jwt_token
+
+    def _normalize_private_key(self, value: str) -> str:
+        return (value or "").strip().replace("\\n", "\n")
+
+
+@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.3")
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -142,6 +196,10 @@ class QWeatherPlugin(Star):
             api_key=self._conf("qweather_api_key"),
             api_host=self._conf("qweather_api_host", "https://devapi.qweather.com"),
             timeout=int(self._conf("request_timeout_seconds", 10) or 10),
+            jwt_project_id=self._conf("qweather_jwt_project_id"),
+            jwt_key_id=self._conf("qweather_jwt_key_id"),
+            jwt_private_key=self._conf("qweather_jwt_private_key"),
+            jwt_ttl_seconds=int(self._conf("qweather_jwt_ttl_seconds", 900) or 900),
         )
 
     @filter.command("天气")
