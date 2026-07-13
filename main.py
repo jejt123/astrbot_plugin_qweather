@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
 import re
 import time as time_module
@@ -10,6 +11,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 
 import jwt
@@ -62,22 +64,30 @@ class QWeatherClient:
         self._jwt_expires_at = 0
         self.log_level = self._normalize_log_level(log_level)
         self._location_cache: dict[str, str] = {}
+        self._location_detail_cache: dict[str, dict[str, Any]] = {}
 
     async def lookup_location(self, keyword: str) -> str:
+        location = await self.lookup_location_detail(keyword)
+        location_id = str(location.get("id") or "").strip()
+        if not location_id:
+            raise QWeatherError(f"和风天气未返回有效位置 ID：{keyword}")
+        return location_id
+
+    async def lookup_location_detail(self, keyword: str) -> dict[str, Any]:
         keyword = keyword.strip()
         if not keyword:
             raise QWeatherError("城市或地址不能为空。")
-        if keyword in self._location_cache:
-            return self._location_cache[keyword]
+        if keyword in self._location_detail_cache:
+            return self._location_detail_cache[keyword]
         payload = await self._get_json("/geo/v2/city/lookup", {"location": keyword, "range": "cn"})
         locations = payload.get("location") or []
         if not locations:
             raise QWeatherError(f"未找到位置：{keyword}")
-        location_id = str(locations[0].get("id") or "").strip()
-        if not location_id:
-            raise QWeatherError(f"和风天气未返回有效位置 ID：{keyword}")
-        self._location_cache[keyword] = location_id
-        return location_id
+        location = locations[0]
+        self._location_detail_cache[keyword] = location
+        if location_id := str(location.get("id") or "").strip():
+            self._location_cache[keyword] = location_id
+        return location
 
     async def resolve_weather_location(self, keyword: str) -> str:
         coordinate = self._normalize_coordinate(keyword)
@@ -99,6 +109,21 @@ class QWeatherClient:
         location = await self.resolve_weather_location(keyword)
         payload = await self._get_json("/v7/warning/now", {"location": location})
         return payload.get("warning") or []
+
+    async def current_weather_alert(self, latitude: str, longitude: str) -> dict[str, Any]:
+        return await self._get_json(f"/weatheralert/v1/current/{latitude}/{longitude}", {"localTime": "true"})
+
+    async def resolve_alert_coordinate(self, keyword: str) -> tuple[str, str]:
+        coordinate = self._normalize_coordinate(keyword)
+        if coordinate:
+            longitude, latitude = coordinate.split(",", 1)
+            return latitude, longitude
+        location = await self.lookup_location_detail(keyword)
+        longitude = str(location.get("lon") or "").strip()
+        latitude = str(location.get("lat") or "").strip()
+        if not longitude or not latitude:
+            raise QWeatherError(f"未能解析预警查询所需的经纬度：{keyword}")
+        return latitude, longitude
 
     def _normalize_coordinate(self, value: str) -> str | None:
         match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", value or "")
@@ -239,7 +264,7 @@ class QWeatherClient:
         return text if len(text) <= 2000 else text[:2000] + "...<truncated>"
 
 
-@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.5")
+@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.6")
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -254,6 +279,9 @@ class QWeatherPlugin(Star):
             jwt_ttl_seconds=int(self._conf("qweather_jwt_ttl_seconds", 900) or 900),
             log_level=self._conf("qweather_log_level", "info"),
         )
+        self.warning_response_cache_minutes = max(1, int(self._conf("warning_response_cache_minutes", 10) or 10))
+        self.warning_state_ttl_hours = 48
+        self.warning_state_path = Path(__file__).with_name("warning_state.json")
 
     @filter.command("天气")
     async def weather(self, event: AstrMessageEvent, city: str | None = None):
@@ -315,15 +343,291 @@ class QWeatherPlugin(Star):
             "   查询插件配置页面中的默认城市。\n\n"
             "3. /通勤\n"
             "   根据当前时间自动判断输出今日/明日上班、下班天气和交通方式建议。\n\n"
+            "4. /预警\n"
+            "   手动查询当前生效天气预警；没有预警时也会回复。\n\n"
+            "5. /预警检查\n"
+            "   定时检查入口，仅在有新增或更新预警时输出。\n\n"
             "需要先在插件配置页面填写：和风天气 API Key、API Host、默认城市、家地址、公司地址、"
             "上下班时间段、可选通勤方式。"
         )
+
+    @filter.command("预警")
+    async def warning(self, event: AstrMessageEvent):
+        """手动查询当前生效天气预警。"""
+        try:
+            state = self._load_warning_state()
+            self._cleanup_warning_state(state)
+            result = await self._collect_warning_alerts(state, force_refresh=False)
+            self._save_warning_state(state)
+            yield event.plain_result(self._format_warning_query_result(result))
+        except Exception as exc:
+            logger.exception("/预警 执行失败")
+            yield event.plain_result(f"天气预警查询失败：{exc}")
+
+    @filter.command("预警检查")
+    async def warning_check(self, event: AstrMessageEvent):
+        """定时插件使用：仅在有新增或更新预警时输出。"""
+        try:
+            state = self._load_warning_state()
+            self._cleanup_warning_state(state)
+            result = await self._collect_warning_alerts(state, force_refresh=False)
+            new_alerts = self._find_new_warning_alerts(result["alerts"], state)
+            if not new_alerts:
+                self._save_warning_state(state)
+                return
+            self._mark_warning_alerts_seen(new_alerts, state)
+            self._save_warning_state(state)
+            yield event.plain_result(self._format_warning_check_result(new_alerts, result.get("attributions", [])))
+        except Exception as exc:
+            logger.warning(f"/预警检查 执行失败，已静默忽略：{exc}")
 
     def _conf(self, key: str, default: Any = "") -> Any:
         try:
             return self.config.get(key, default)
         except AttributeError:
             return self.config[key] if key in self.config else default
+
+    async def _collect_warning_alerts(self, state: dict[str, Any], force_refresh: bool = False) -> dict[str, Any]:
+        locations = self._warning_locations()
+        if not locations:
+            raise QWeatherError("请先在插件配置页面设置默认城市、家地址或公司地址，用于查询天气预警。")
+
+        now = datetime.now()
+        all_alerts: dict[str, dict[str, Any]] = {}
+        attributions: list[dict[str, Any]] = []
+        checked_locations: list[str] = []
+        failures: list[str] = []
+
+        for label, location in locations:
+            try:
+                latitude, longitude = await self.client.resolve_alert_coordinate(location)
+                cache_key = f"{latitude},{longitude}"
+                payload = self._get_warning_cached_response(state, cache_key, now)
+                if force_refresh or payload is None:
+                    payload = await self.client.current_weather_alert(latitude, longitude)
+                    self._set_warning_cached_response(state, cache_key, payload, now)
+                checked_locations.append(label)
+                attributions.extend(payload.get("metadata", {}).get("attributions") or [])
+                for alert in payload.get("alerts") or []:
+                    normalized = self._normalize_warning_alert(alert, label)
+                    key = normalized["dedupe_key"]
+                    if key not in all_alerts:
+                        all_alerts[key] = normalized
+                    elif label not in all_alerts[key]["locations"]:
+                        all_alerts[key]["locations"].append(label)
+            except Exception as exc:
+                failures.append(f"{label}: {exc}")
+                logger.warning(f"天气预警位置查询失败：{label}，{exc}")
+
+        return {
+            "alerts": list(all_alerts.values()),
+            "attributions": self._unique_attributions(attributions),
+            "checked_locations": checked_locations,
+            "failures": failures,
+        }
+
+    def _warning_locations(self) -> list[tuple[str, str]]:
+        candidates = [
+            ("家", str(self._conf("home_coordinates") or "").strip() or str(self._conf("home_location") or "").strip()),
+            ("公司", str(self._conf("work_coordinates") or "").strip() or str(self._conf("work_location") or "").strip()),
+            ("默认城市", str(self._conf("default_city") or "").strip()),
+        ]
+        locations: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for label, location in candidates:
+            if not location or location in seen:
+                continue
+            locations.append((label, location))
+            seen.add(location)
+        return locations
+
+    def _load_warning_state(self) -> dict[str, Any]:
+        if not self.warning_state_path.exists():
+            return {"response_cache": {}, "seen_alerts": {}}
+        try:
+            data = json.loads(self.warning_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"response_cache": {}, "seen_alerts": {}}
+        return {
+            "response_cache": data.get("response_cache") or {},
+            "seen_alerts": data.get("seen_alerts") or {},
+        }
+
+    def _save_warning_state(self, state: dict[str, Any]) -> None:
+        self.warning_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    def _cleanup_warning_state(self, state: dict[str, Any]) -> None:
+        now = datetime.now()
+        cache = state.setdefault("response_cache", {})
+        for key, item in list(cache.items()):
+            expires_at = self._parse_datetime(item.get("expires_at"))
+            if not expires_at or expires_at <= now:
+                cache.pop(key, None)
+
+        seen_alerts = state.setdefault("seen_alerts", {})
+        cutoff = now - timedelta(hours=self.warning_state_ttl_hours)
+        for key, item in list(seen_alerts.items()):
+            keep_until = self._parse_datetime(item.get("keep_until"))
+            last_notified = self._parse_datetime(item.get("last_notified"))
+            if (keep_until and keep_until <= now) or (not keep_until and (not last_notified or last_notified <= cutoff)):
+                seen_alerts.pop(key, None)
+
+    def _get_warning_cached_response(self, state: dict[str, Any], cache_key: str, now: datetime) -> dict[str, Any] | None:
+        item = state.setdefault("response_cache", {}).get(cache_key)
+        if not item:
+            return None
+        expires_at = self._parse_datetime(item.get("expires_at"))
+        if not expires_at or expires_at <= now:
+            state["response_cache"].pop(cache_key, None)
+            return None
+        return item.get("payload")
+
+    def _set_warning_cached_response(self, state: dict[str, Any], cache_key: str, payload: dict[str, Any], now: datetime) -> None:
+        expires_at = now + timedelta(minutes=self.warning_response_cache_minutes)
+        state.setdefault("response_cache", {})[cache_key] = {
+            "fetched_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "payload": payload,
+        }
+
+    def _normalize_warning_alert(self, alert: dict[str, Any], location_label: str) -> dict[str, Any]:
+        alert_id = str(alert.get("id") or "").strip()
+        headline = str(alert.get("headline") or alert.get("title") or "天气预警").strip()
+        fingerprint = self._warning_fingerprint(alert)
+        dedupe_key = alert_id or fingerprint
+        return {
+            "dedupe_key": dedupe_key,
+            "fingerprint": fingerprint,
+            "id": alert_id,
+            "headline": headline,
+            "sender": alert.get("senderName") or alert.get("sender") or "",
+            "issued_time": alert.get("issuedTime") or "",
+            "expire_time": alert.get("expireTime") or "",
+            "severity": self._warning_named_value(alert.get("severity")),
+            "color": self._warning_named_value(alert.get("color")),
+            "event": self._warning_named_value(alert.get("eventType")),
+            "message_type": self._warning_named_value(alert.get("messageType")),
+            "description": alert.get("description") or "",
+            "instruction": alert.get("instruction") or "",
+            "locations": [location_label],
+        }
+
+    def _warning_fingerprint(self, alert: dict[str, Any]) -> str:
+        source = json.dumps(
+            {
+                "headline": alert.get("headline") or alert.get("title"),
+                "messageType": alert.get("messageType"),
+                "severity": alert.get("severity"),
+                "color": alert.get("color"),
+                "issuedTime": alert.get("issuedTime"),
+                "expireTime": alert.get("expireTime"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    def _warning_named_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("name") or value.get("code") or value.get("text") or "").strip()
+        return str(value or "").strip()
+
+    def _find_new_warning_alerts(self, alerts: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+        seen = state.setdefault("seen_alerts", {})
+        new_alerts = []
+        for alert in alerts:
+            previous = seen.get(alert["dedupe_key"])
+            if not previous or previous.get("fingerprint") != alert["fingerprint"]:
+                new_alerts.append(alert)
+        return new_alerts
+
+    def _mark_warning_alerts_seen(self, alerts: list[dict[str, Any]], state: dict[str, Any]) -> None:
+        now = datetime.now()
+        seen = state.setdefault("seen_alerts", {})
+        for alert in alerts:
+            expire_time = self._parse_datetime(alert.get("expire_time"))
+            keep_until = expire_time + timedelta(hours=24) if expire_time else now + timedelta(hours=self.warning_state_ttl_hours)
+            seen[alert["dedupe_key"]] = {
+                "fingerprint": alert["fingerprint"],
+                "headline": alert["headline"],
+                "last_notified": now.isoformat(),
+                "expire_time": alert.get("expire_time") or "",
+                "keep_until": keep_until.isoformat(),
+            }
+
+    def _format_warning_query_result(self, result: dict[str, Any]) -> str:
+        alerts = result.get("alerts") or []
+        if not alerts:
+            if result.get("failures") and not result.get("checked_locations"):
+                return "天气预警查询失败：" + "；".join(result["failures"])
+            lines = ["✅ 当前暂无生效天气预警"]
+            if result.get("checked_locations"):
+                lines.append("查询位置：" + "、".join(result["checked_locations"]))
+            if result.get("failures"):
+                lines.append("部分位置查询失败：" + "；".join(result["failures"]))
+            return "\n".join(lines)
+        return self._format_warning_alerts("⚠️ 当前生效天气预警", alerts, result.get("attributions", []), include_details=True)
+
+    def _format_warning_check_result(self, alerts: list[dict[str, Any]], attributions: list[dict[str, Any]]) -> str:
+        return self._format_warning_alerts("⚠️ 新增或更新天气预警", alerts, attributions, include_details=False)
+
+    def _format_warning_alerts(self, title: str, alerts: list[dict[str, Any]], attributions: list[dict[str, Any]], include_details: bool) -> str:
+        lines = [title, ""]
+        for index, alert in enumerate(alerts, 1):
+            lines.append(f"{index}. {alert['headline']}")
+            if alert.get("locations"):
+                lines.append("影响位置：" + "、".join(alert["locations"]))
+            if alert.get("sender"):
+                lines.append(f"发布单位：{alert['sender']}")
+            if alert.get("issued_time"):
+                lines.append(f"发布时间：{alert['issued_time']}")
+            if alert.get("expire_time"):
+                lines.append(f"失效时间：{alert['expire_time']}")
+            level_parts = [part for part in [alert.get("severity"), alert.get("color"), alert.get("event")] if part]
+            if level_parts:
+                lines.append("级别/类型：" + " / ".join(level_parts))
+            if include_details and alert.get("description"):
+                lines.append("说明：" + self._compact_text(alert["description"], 160))
+            if include_details and alert.get("instruction"):
+                lines.append("建议：" + self._compact_text(alert["instruction"], 160))
+            lines.append("")
+        attribution_text = self._format_attributions(attributions)
+        if attribution_text:
+            lines.append(attribution_text)
+        return "\n".join(lines).strip()
+
+    def _compact_text(self, value: str, limit: int) -> str:
+        text = re.sub(r"\s+", " ", value or "").strip()
+        return text if len(text) <= limit else text[:limit] + "..."
+
+    def _unique_attributions(self, attributions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique = []
+        seen = set()
+        for item in attributions:
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
+
+    def _format_attributions(self, attributions: list[dict[str, Any]]) -> str:
+        names = []
+        for item in attributions:
+            name = item.get("name") or item.get("title") or item.get("url")
+            if name:
+                names.append(str(name))
+        if not names:
+            return ""
+        return "数据来源：" + "、".join(dict.fromkeys(names))
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
 
     async def _safe_warnings(self, location: str) -> list[dict[str, Any]]:
         try:

@@ -2,6 +2,15 @@
 
 All notable changes to `astrbot_plugin_qweather` are documented in this file.
 
+## v0.1.6 - 2026-07-13
+
+### Added
+- Added `/预警` for manual current weather alert queries with explicit success, no-alert, or failure output.
+- Added `/预警检查` for scheduler-style checks that only outputs when new or updated alerts are found.
+- Added configurable weather alert response cache duration, defaulting to 10 minutes.
+- Added 48-hour weather alert dedupe state retention with automatic cleanup on each warning command run.
+- Added current Weather Alert API support using latitude/longitude coordinates and alert attribution formatting.
+
 ## v0.1.5 - 2026-07-09
 
 ### Changed

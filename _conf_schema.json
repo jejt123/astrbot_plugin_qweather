@@ -47,6 +47,12 @@
     "hint": "控制插件内部和风天气请求日志输出级别。debug 会记录请求和返回数据摘要；日志会隐藏 API Key、JWT、私钥等敏感信息。",
     "default": "info"
   },
+  "warning_response_cache_minutes": {
+    "description": "天气预警响应缓存时间（分钟）",
+    "type": "int",
+    "hint": "/预警 和 /预警检查 复用预警 API 响应的时间，默认 10 分钟。去重状态固定保留 48 小时，不提供配置。",
+    "default": 10
+  },
   "default_city": {
     "description": "默认城市",
     "type": "string",
