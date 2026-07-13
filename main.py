@@ -264,7 +264,7 @@ class QWeatherClient:
         return text if len(text) <= 2000 else text[:2000] + "...<truncated>"
 
 
-@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.6")
+@register("astrbot_plugin_qweather", "OpenAI", "和风天气通勤建议插件", "0.1.7")
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -367,6 +367,7 @@ class QWeatherPlugin(Star):
     @filter.command("预警检查")
     async def warning_check(self, event: AstrMessageEvent):
         """定时插件使用：仅在有新增或更新预警时输出。"""
+        event.stop_event()
         try:
             state = self._load_warning_state()
             self._cleanup_warning_state(state)
@@ -614,7 +615,12 @@ class QWeatherPlugin(Star):
     def _format_attributions(self, attributions: list[dict[str, Any]]) -> str:
         names = []
         for item in attributions:
-            name = item.get("name") or item.get("title") or item.get("url")
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("title") or item.get("url")
+            else:
+                name = str(item) if item else ""
             if name:
                 names.append(str(name))
         if not names:

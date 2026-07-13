@@ -2,6 +2,12 @@
 
 All notable changes to `astrbot_plugin_qweather` are documented in this file.
 
+## v0.1.7 - 2026-07-13
+
+### Fixed
+- Fixed `/预警` formatting when QWeather alert attributions are returned as strings instead of objects.
+- Fixed `/预警检查` falling through to the default AI reply flow when no new alert output is produced.
+
 ## v0.1.6 - 2026-07-13
 
 ### Added
